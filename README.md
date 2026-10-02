@@ -1,4 +1,4 @@
-# PortfolioPilot: Milestone 09 — Valuation and Performance Calculations
+# Valuation and Performance Calculations
 
 This learning activity adds financial calculations and a private portfolio summary API to PortfolioPilot, a teaching project for managing stock portfolios. The calculations use USD stocks and long-only positions: users can sell shares they own, but cannot sell more than they hold. The next activity connects these results to the frontend.
 
