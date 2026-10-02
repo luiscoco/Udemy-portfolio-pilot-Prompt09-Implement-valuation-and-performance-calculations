@@ -1,0 +1,56 @@
+import type { PrismaClient } from './generated/prisma/client.js';
+import { portfolioService } from './portfolio-service.js';
+import { portfolioTransactionDtoSchema } from '@portfolio-pilot/contracts';
+
+const ownerBrand: unique symbol = Symbol('authenticated-owner');
+export type AuthenticatedOwner = Readonly<{ userId: string; [ownerBrand]: true }>;
+const contexts = new WeakSet<object>();
+/** Server-only: token must come from the verified HttpOnly session cookie, never request JSON. */
+export async function authenticateOwner(db: PrismaClient, token: string, now = new Date()): Promise<AuthenticatedOwner> {
+  if (!token || !Number.isFinite(now.getTime())) throw new Error('UNAUTHORIZED');
+  const session = await db.session.findUnique({ where: { token } });
+  if (!session || session.expiresAt <= now) throw new Error('UNAUTHORIZED');
+  const owner: AuthenticatedOwner = Object.freeze({ userId: session.userId, [ownerBrand]: true as const });
+  contexts.add(owner);
+  return owner;
+}
+export function requireOwner(owner: AuthenticatedOwner): string {
+  if (!owner || !contexts.has(owner)) throw new Error('UNAUTHORIZED');
+  return owner.userId;
+}
+export function ownerRepositories(db: PrismaClient, owner: AuthenticatedOwner) {
+  const ownerId = requireOwner(owner);
+  return {
+    listPortfolios: () => db.portfolio.findMany({ where: { ownerId }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }),
+    getPortfolio: (id: string) => db.portfolio.findFirst({ where: { id, ownerId } }),
+    createPortfolio: (name: string) => {
+      const normalized = name.trim();
+      if (!normalized || normalized.length > 100) throw new Error('INVALID_NAME');
+      return db.portfolio.create({ data: { ownerId, name: normalized } });
+    },
+    renamePortfolio: (id: string, name: string) => {
+      const normalized = name.trim();
+      if (!normalized || normalized.length > 100) throw new Error('INVALID_NAME');
+      return portfolioService(db, owner).edit(id, { name: normalized }).then(() => ({ count: 1 }));
+    },
+    deletePortfolio: (id: string) => portfolioService(db, owner).archive(id).then(() => ({ count: 1 })),
+    listTransactions: async (portfolioId: string, take = 100) => {
+      if (!Number.isInteger(take) || take < 1 || take > 100) throw new Error('INVALID_LIMIT');
+      const rows = await db.portfolioTransaction.findMany({
+        where: { portfolioId, portfolio: { ownerId } },
+        orderBy: [{ occurredAt: 'asc' }, { ledgerOrder: 'asc' }], take,
+        include: { security: { select: { symbol: true, exchangeMic: true, currency: true } } }
+      });
+      return rows.map(row => portfolioTransactionDtoSchema.parse({ ...row, quantity: row.quantity.toFixed(), price: row.price.toFixed(), fees: row.fees.toFixed(), amount: row.amount.toFixed(), occurredAt: row.occurredAt.toISOString(), createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString() }));
+    },
+    listWatchlist: () => db.watchlistEntry.findMany({ where: { ownerId }, include: { security: true }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] }),
+    addWatchlistEntry: (securityId: string) => db.watchlistEntry.upsert({ where: { ownerId_securityId: { ownerId, securityId } }, update: {}, create: { ownerId, securityId } }),
+    removeWatchlistEntry: (id: string) => db.watchlistEntry.deleteMany({ where: { id, ownerId } }),
+    listQuotes: async () => {
+      const rows = await db.quoteSnapshot.findMany({ where: { security: { OR: [{ watchlist: { some: { ownerId } } }, { transactions: { some: { portfolio: { ownerId } } } }] } }, orderBy: [{ asOf: 'desc' }, { id: 'asc' }], take: 100 });
+      return rows.map(row => ({ ...row, price: row.price.toFixed(), asOf: row.asOf.toISOString(), createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString() }));
+    },
+    listNews: () => db.newsArticle.findMany({ where: { securities: { some: { security: { OR: [{ watchlist: { some: { ownerId } } }, { transactions: { some: { portfolio: { ownerId } } } }] } } } }, orderBy: [{ publishedAt: 'desc' }, { id: 'asc' }], take: 100 })
+  };
+}
+
